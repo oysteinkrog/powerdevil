@@ -172,6 +172,8 @@ void ScreenBrightnessController::onDetectorDisplaysChanged()
         if (added || replaced) {
             connect(info.display, &QObject::destroyed, this, &ScreenBrightnessController::onDisplayDestroyed);
             connect(info.display, &DisplayBrightness::externalBrightnessChangeObserved, this, &ScreenBrightnessController::onExternalBrightnessChangeObserved);
+            // a new display object knows nothing about the current dimming state
+            info.display->setDimmingMultiplier(dimmingRatioForDisplay(displayId));
         } else {
             // migrate any local state from the old element to its replacement
             info.trackingError = it->second.trackingError;

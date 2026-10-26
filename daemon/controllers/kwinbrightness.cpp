@@ -134,7 +134,9 @@ KWinDisplayBrightness::KWinDisplayBrightness(const KScreen::OutputPtr &output, K
     , m_detector(detector)
     , m_label(label)
     , m_desiredBrightness(m_output->brightness())
-    , m_desiredDimming(1.0)
+    // start from what KWin applies now, so that a dimming ratio left behind by an earlier
+    // display object or powerdevil instance gets corrected by setDimmingMultiplier()
+    , m_desiredDimming(m_output->dimming())
 {
     connect(m_output.get(), &KScreen::Output::brightnessChanged, this, &KWinDisplayBrightness::handleBrightnessChanged);
 }
