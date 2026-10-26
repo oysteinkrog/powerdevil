@@ -11,10 +11,17 @@
 #include <powerdevil_debug.h>
 
 #include <QMutex>
+#include <QSet>
+#include <QTimer>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <map>
 #include <memory> // std::unique_ptr
 #include <span>
+
+using namespace std::chrono_literals;
 
 #ifdef WITH_DDCUTIL
 #include <ddcutil_c_api.h>
@@ -60,13 +67,27 @@ private Q_SLOTS:
     void removeDisplay(const QString &id);
 
 private:
+    void markLost(const QString &id);
+    void scheduleRecovery();
+
     std::map<QString, std::unique_ptr<DDCutilDisplay>> m_displays;
     std::map<QString, std::unique_ptr<DDCutilDisplay>> m_pendingDisplays;
     // ddcutil has global state, let's avoid simultaneous access to its open display map
     QMutex m_openDisplayMutex;
     bool m_performedDetection = false;
     bool m_noDdcutil = false;
+
+    // Displays that had working brightness control and then went away. A monitor that sleeps,
+    // or is turned off by a remote session, can drop off DDC/CI without a later event telling
+    // us it is back, or be back but not ready yet when the event comes. Keep redetecting until
+    // each one returns. Displays that never worked are not tracked, so they are not retried.
+    QSet<QString> m_lostDisplayIds;
+    QTimer m_recoveryTimer;
+    size_t m_recoveryAttempt = 0;
 };
+
+// after the last interval, keep retrying at that interval
+constexpr std::array s_recoveryIntervals = {2s, 5s, 15s, 30s, 60s, 120s, 300s};
 
 #if DDCUTIL_VERSION >= QT_VERSION_CHECK(2, 1, 0)
 void ddcaCallback(DDCA_Display_Status_Event event)
@@ -109,6 +130,15 @@ DDCutilPrivateSingleton::DDCutilPrivateSingleton()
 
     connect(this, &DDCutilPrivateSingleton::displayAdded, this, &DDCutilPrivateSingleton::redetect);
     connect(this, &DDCutilPrivateSingleton::displayRemoved, this, &DDCutilPrivateSingleton::removeDisplay);
+
+    m_recoveryTimer.setSingleShot(true);
+    connect(&m_recoveryTimer, &QTimer::timeout, this, [this]() {
+        if (m_lostDisplayIds.isEmpty()) {
+            return;
+        }
+        ++m_recoveryAttempt;
+        redetect();
+    });
 
     ddca_start_watch_displays(DDCA_Display_Event_Class(DDCA_EVENT_CLASS_ALL));
 #endif
@@ -175,7 +205,12 @@ void DDCutilPrivateSingleton::detect()
                 auto displayNode = m_pendingDisplays.extract(id);
                 if (success) {
                     m_displays.insert(std::move(displayNode));
+                    if (m_lostDisplayIds.remove(id)) {
+                        qCWarning(POWERDEVIL) << "[DDCutilDetector]: Display" << id << "is back";
+                    }
                     Q_EMIT displaysChanged();
+                } else if (m_lostDisplayIds.contains(id)) {
+                    scheduleRecovery();
                 }
             });
             m_pendingDisplays.emplace(id, std::move(display));
@@ -211,6 +246,27 @@ void DDCutilPrivateSingleton::redetect()
         qCCritical(POWERDEVIL) << "[DDCutilDetector]: Redetection failed";
     }
 
+    for (const auto &[id, display] : invalidDisplays) {
+        if (!m_displays.contains(id)) {
+            markLost(id);
+        }
+    }
+    for (const auto &[id, display] : m_displays) {
+        if (m_lostDisplayIds.remove(id)) {
+            qCWarning(POWERDEVIL) << "[DDCutilDetector]: Display" << id << "is back";
+        }
+    }
+    // a lost display still waiting for its init retries reports back through retryInitFinished
+    const bool waitingForInit = std::any_of(m_lostDisplayIds.cbegin(), m_lostDisplayIds.cend(), [this](const QString &id) {
+        return m_pendingDisplays.contains(id);
+    });
+    if (m_lostDisplayIds.isEmpty()) {
+        m_recoveryTimer.stop();
+        m_recoveryAttempt = 0;
+    } else if (!waitingForInit) {
+        scheduleRecovery();
+    }
+
     if (!m_displays.empty() || !invalidDisplays.empty()) {
         Q_EMIT displaysChanged();
     }
@@ -242,9 +298,32 @@ void DDCutilPrivateSingleton::removeDisplay(const QString &id)
 
     if (auto deletedAfterEmit = m_displays.extract(id); !deletedAfterEmit.empty()) {
         qCDebug(POWERDEVIL) << "[DDCutilDetector]: Removing display" << id;
+        markLost(id);
+        m_recoveryTimer.stop();
+        m_recoveryAttempt = 0;
+        scheduleRecovery();
         Q_EMIT displaysChanged();
     } else {
         qCDebug(POWERDEVIL) << "[DDCutilDetector]: Failed to remove display" << id;
+    }
+}
+
+void DDCutilPrivateSingleton::markLost(const QString &id)
+{
+    if (!id.isEmpty() && !m_lostDisplayIds.contains(id)) {
+        m_lostDisplayIds.insert(id);
+        qCWarning(POWERDEVIL) << "[DDCutilDetector]: Lost DDC/CI brightness control for display" << id << "- will keep looking for it";
+    }
+}
+
+void DDCutilPrivateSingleton::scheduleRecovery()
+{
+    if (m_lostDisplayIds.isEmpty() || m_recoveryTimer.isActive()) {
+        return;
+    }
+    m_recoveryTimer.start(s_recoveryIntervals[std::min(m_recoveryAttempt, s_recoveryIntervals.size() - 1)]);
+    if (m_recoveryAttempt < s_recoveryIntervals.size()) {
+        qCWarning(POWERDEVIL) << "[DDCutilDetector]: Redetecting lost display(s)" << m_lostDisplayIds.values() << "in" << m_recoveryTimer.interval() << "ms";
     }
 }
 #endif
