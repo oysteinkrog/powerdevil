@@ -122,6 +122,24 @@ DDCutilPrivateSingleton::DDCutilPrivateSingleton()
         return;
     }
 #endif
+    m_recoveryTimer.setSingleShot(true);
+    connect(&m_recoveryTimer, &QTimer::timeout, this, [this]() {
+        if (m_lostDisplayIds.isEmpty()) {
+            return;
+        }
+        // a lost display that is still running its init retries reports back through
+        // retryInitFinished; redetecting now would throw that attempt away
+        const bool waitingForInit = std::any_of(m_lostDisplayIds.cbegin(), m_lostDisplayIds.cend(), [this](const QString &id) {
+            return m_pendingDisplays.contains(id);
+        });
+        ++m_recoveryAttempt;
+        if (waitingForInit) {
+            scheduleRecovery();
+        } else {
+            redetect();
+        }
+    });
+
 #if DDCUTIL_VERSION >= QT_VERSION_CHECK(2, 1, 0)
     if (ddca_register_display_status_callback(ddcaCallback)) {
         qCWarning(POWERDEVIL) << "[DDCutilDetector]: Failed to initialize callback";
@@ -130,15 +148,6 @@ DDCutilPrivateSingleton::DDCutilPrivateSingleton()
 
     connect(this, &DDCutilPrivateSingleton::displayAdded, this, &DDCutilPrivateSingleton::redetect);
     connect(this, &DDCutilPrivateSingleton::displayRemoved, this, &DDCutilPrivateSingleton::removeDisplay);
-
-    m_recoveryTimer.setSingleShot(true);
-    connect(&m_recoveryTimer, &QTimer::timeout, this, [this]() {
-        if (m_lostDisplayIds.isEmpty()) {
-            return;
-        }
-        ++m_recoveryAttempt;
-        redetect();
-    });
 
     ddca_start_watch_displays(DDCA_Display_Event_Class(DDCA_EVENT_CLASS_ALL));
 #endif
@@ -209,9 +218,8 @@ void DDCutilPrivateSingleton::detect()
                         qCWarning(POWERDEVIL) << "[DDCutilDetector]: Display" << id << "is back";
                     }
                     Q_EMIT displaysChanged();
-                } else if (m_lostDisplayIds.contains(id)) {
-                    scheduleRecovery();
                 }
+                scheduleRecovery();
             });
             m_pendingDisplays.emplace(id, std::move(display));
             continue;
@@ -256,14 +264,10 @@ void DDCutilPrivateSingleton::redetect()
             qCWarning(POWERDEVIL) << "[DDCutilDetector]: Display" << id << "is back";
         }
     }
-    // a lost display still waiting for its init retries reports back through retryInitFinished
-    const bool waitingForInit = std::any_of(m_lostDisplayIds.cbegin(), m_lostDisplayIds.cend(), [this](const QString &id) {
-        return m_pendingDisplays.contains(id);
-    });
     if (m_lostDisplayIds.isEmpty()) {
         m_recoveryTimer.stop();
         m_recoveryAttempt = 0;
-    } else if (!waitingForInit) {
+    } else {
         scheduleRecovery();
     }
 
@@ -305,6 +309,7 @@ void DDCutilPrivateSingleton::removeDisplay(const QString &id)
         Q_EMIT displaysChanged();
     } else {
         qCDebug(POWERDEVIL) << "[DDCutilDetector]: Failed to remove display" << id;
+        scheduleRecovery(); // the pending init we just cancelled may have been a lost display's
     }
 }
 
